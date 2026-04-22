@@ -257,10 +257,18 @@ Run `claw --help` for usage."
 /// Returns a snake_case token that downstream consumers can switch on instead
 /// of regex-scraping the prose. The classification is best-effort prefix/keyword
 /// matching against the error messages produced throughout the CLI surface.
+/// #130b: Wrap io::Error with operation context so classifier can recognize filesystem failures.
+fn contextualize_io_error(operation: &str, target: &str, error: std::io::Error) -> String {
+    format!("{} failed: {} ({})", operation, target, error)
+}
+
 fn classify_error_kind(message: &str) -> &'static str {
     // Check specific patterns first (more specific before generic)
     if message.contains("missing Anthropic credentials") {
         "missing_credentials"
+    } else if message.contains("export failed:") || message.contains("diff failed:") || message.contains("config failed:") {
+        // #130b: Filesystem operation errors enriched with operation+path context.
+        "filesystem_io_error"
     } else if message.contains("Manifest source files are missing") {
         "missing_manifests"
     } else if message.contains("no worker state file found") {
@@ -452,6 +460,113 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
+        // #251: session-management verbs (list-sessions, load-session,
+        // delete-session, flush-transcript) are pure-local operations.
+        // They are intercepted at the parser level and dispatched directly
+        // to session-control operations without requiring credentials.
+        CliAction::ListSessions { output_format } => {
+            use runtime::session_control::list_managed_sessions_for;
+            let base_dir = env::current_dir()?;
+            let sessions = list_managed_sessions_for(base_dir)?;
+            match output_format {
+                CliOutputFormat::Text => {
+                    if sessions.is_empty() {
+                        println!("No sessions found.");
+                    } else {
+                        for session in sessions {
+                            println!("{} ({})", session.id, session.path.display());
+                        }
+                    }
+                }
+                CliOutputFormat::Json => {
+                    // #251: ManagedSessionSummary doesn't impl Serialize;
+                    // construct JSON manually with the public fields.
+                    let sessions_json: Vec<serde_json::Value> = sessions
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "id": s.id,
+                                "path": s.path.display().to_string(),
+                                "updated_at_ms": s.updated_at_ms,
+                                "message_count": s.message_count,
+                            })
+                        })
+                        .collect();
+                    let result = serde_json::json!({
+                        "command": "list-sessions",
+                        "sessions": sessions_json,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+            }
+        }
+        CliAction::LoadSession {
+            session_reference,
+            output_format,
+        } => {
+            use runtime::session_control::load_managed_session_for;
+            let base_dir = env::current_dir()?;
+            let loaded = load_managed_session_for(base_dir, &session_reference)?;
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!(
+                        "Session {} loaded\n  File       {}\n  Messages   {}",
+                        loaded.session.session_id,
+                        loaded.handle.path.display(),
+                        loaded.session.messages.len()
+                    );
+                }
+                CliOutputFormat::Json => {
+                    let result = serde_json::json!({
+                        "command": "load-session",
+                        "session": {
+                            "id": loaded.session.session_id,
+                            "path": loaded.handle.path.display().to_string(),
+                            "messages": loaded.session.messages.len(),
+                        },
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+            }
+        }
+        CliAction::DeleteSession {
+            session_id: _,
+            output_format,
+        } => {
+            // #251: delete-session implementation deferred
+            eprintln!("delete-session is not yet implemented.");
+            if matches!(output_format, CliOutputFormat::Json) {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "error",
+                        "error": "not_yet_implemented",
+                        "command": "delete-session",
+                        "kind": "not_yet_implemented",
+                    })
+                );
+            }
+            std::process::exit(1);
+        }
+        CliAction::FlushTranscript {
+            session_id: _,
+            output_format,
+        } => {
+            // #251: flush-transcript implementation deferred
+            eprintln!("flush-transcript is not yet implemented.");
+            if matches!(output_format, CliOutputFormat::Json) {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "error",
+                        "error": "not_yet_implemented",
+                        "command": "flush-transcript",
+                        "kind": "not_yet_implemented",
+                    })
+                );
+            }
+            std::process::exit(1);
+        }
         CliAction::Export {
             session_reference,
             output_path,
@@ -579,6 +694,26 @@ enum CliAction {
     Help {
         output_format: CliOutputFormat,
     },
+    // #251: session-management verbs are pure-local reads/mutations on the
+    // session store. They do not require credentials or a model connection.
+    // Previously these fell through to the `_other => Prompt` catchall and
+    // emitted `missing_credentials` errors. Now they are intercepted at the
+    // top-level parser and dispatched to session-control operations.
+    ListSessions {
+        output_format: CliOutputFormat,
+    },
+    LoadSession {
+        session_reference: String,
+        output_format: CliOutputFormat,
+    },
+    DeleteSession {
+        session_id: String,
+        output_format: CliOutputFormat,
+    },
+    FlushTranscript {
+        session_id: String,
+        output_format: CliOutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -596,6 +731,17 @@ enum LocalHelpTopic {
     SystemPrompt,
     DumpManifests,
     BootstrapPlan,
+    // #130c: help parity for `claw diff --help`
+    Diff,
+    // #130d: help parity for `claw config --help`
+    Config,
+    // #130e: help parity — dispatch-order bugs (help, submit, resume)
+    Meta,
+    Submit,
+    Resume,
+    // #130e-B: help parity — surface-level bugs (plugins, prompt)
+    Plugins,
+    Prompt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,20 +790,20 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 if !rest.is_empty()
                     && matches!(
                         rest[0].as_str(),
-                        "prompt"
-                            | "commit"
+                        "commit"
                             | "pr"
                             | "issue"
                     ) =>
             {
                 // `--help` following a subcommand that would otherwise forward
-                // the arg to the API (e.g. `claw prompt --help`) should show
-                // top-level help instead. Subcommands that consume their own
-                // args (agents, mcp, plugins, skills) and local help-topic
-                // subcommands (status, sandbox, doctor, init, state, export,
-                // version, system-prompt, dump-manifests, bootstrap-plan) must
-                // NOT be intercepted here — they handle --help in their own
-                // dispatch paths via parse_local_help_action(). See #141.
+                // the arg to the API should show top-level help instead.
+                // Subcommands that consume their own args (agents, mcp, plugins,
+                // skills) and local help-topic subcommands (status, sandbox,
+                // doctor, init, state, export, version, system-prompt,
+                // dump-manifests, bootstrap-plan, diff, config, help, submit,
+                // resume, prompt) must NOT be intercepted here — they handle
+                // --help in their own dispatch paths via
+                // parse_local_help_action(). See #141, #130c, #130d, #130e.
                 wants_help = true;
                 index += 1;
             }
@@ -909,6 +1055,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // which is synthetic friction. Accepts an optional section name
         // (env|hooks|model|plugins) matching the slash command shape.
         "config" => {
+            // #130d: accept --help / -h and route to help topic instead of silently ignoring
+            if rest.len() >= 2 && is_help_flag(&rest[1]) {
+                return Ok(CliAction::HelpTopic(LocalHelpTopic::Config));
+            }
             let tail = &rest[1..];
             let section = tail.first().cloned();
             if tail.len() > 1 {
@@ -926,6 +1076,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // #146: `diff` is pure-local (shells out to `git diff --cached` +
         // `git diff`). No session needed to inspect the working tree.
         "diff" => {
+            // #130c: accept --help / -h as first argument and route to help topic,
+            // matching the behavior of status/sandbox/doctor/etc.
+            // Without this guard, `claw diff --help` was rejected as extra arguments.
+            if rest.len() == 2 && is_help_flag(&rest[1]) {
+                return Ok(CliAction::HelpTopic(LocalHelpTopic::Diff));
+            }
             if rest.len() > 1 {
                 return Err(format!(
                     "unexpected extra arguments after `claw diff`: {}",
@@ -933,6 +1089,81 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 ));
             }
             Ok(CliAction::Diff { output_format })
+        }
+        // #251: session-management verbs are pure-local operations on the
+        // session store. They require no credentials or model connection.
+        // Previously they fell through to `_other => Prompt` and emitted
+        // `missing_credentials`. Now they are intercepted at parse time and
+        // routed to session-control operations.
+        "list-sessions" => {
+            let tail = &rest[1..];
+            // list-sessions takes no positional arguments; flags are already parsed
+            if !tail.is_empty() {
+                return Err(format!(
+                    "unexpected extra arguments after `claw list-sessions`: {}",
+                    tail.join(" ")
+                ));
+            }
+            Ok(CliAction::ListSessions { output_format })
+        }
+        "load-session" => {
+            let tail = &rest[1..];
+            // load-session requires a session-id (positional) argument
+            let session_ref = tail.first().ok_or_else(|| {
+                "load-session requires a session-id argument (e.g., `claw load-session SESSION.jsonl`)"
+                    .to_string()
+            })?.clone();
+            if tail.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw load-session {session_ref}`: {}",
+                    tail[1..].join(" ")
+                ));
+            }
+            Ok(CliAction::LoadSession {
+                session_reference: session_ref,
+                output_format,
+            })
+        }
+        "delete-session" => {
+            let tail = &rest[1..];
+            // delete-session requires a session-id (positional) argument
+            let session_id = tail.first().ok_or_else(|| {
+                "delete-session requires a session-id argument (e.g., `claw delete-session SESSION_ID`)"
+                    .to_string()
+            })?.clone();
+            if tail.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw delete-session {session_id}`: {}",
+                    tail[1..].join(" ")
+                ));
+            }
+            Ok(CliAction::DeleteSession {
+                session_id,
+                output_format,
+            })
+        }
+        "flush-transcript" => {
+            let tail = &rest[1..];
+            // flush-transcript: optional --session-id flag (parsed above) or as positional
+            let session_id = if tail.is_empty() {
+                // --session-id flag must have been provided
+                return Err(
+                    "flush-transcript requires either --session-id flag or positional argument"
+                        .to_string(),
+                );
+            } else {
+                tail[0].clone()
+            };
+            if tail.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw flush-transcript {session_id}`: {}",
+                    tail[1..].join(" ")
+                ));
+            }
+            Ok(CliAction::FlushTranscript {
+                session_id,
+                output_format,
+            })
         }
         "skills" => {
             let args = join_optional_args(&rest[1..]);
@@ -1050,6 +1281,17 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "system-prompt" => LocalHelpTopic::SystemPrompt,
         "dump-manifests" => LocalHelpTopic::DumpManifests,
         "bootstrap-plan" => LocalHelpTopic::BootstrapPlan,
+        // #130c: help parity for `claw diff --help`
+        "diff" => LocalHelpTopic::Diff,
+        // #130d: help parity for `claw config --help`
+        "config" => LocalHelpTopic::Config,
+        // #130e: help parity — dispatch-order fixes
+        "help" => LocalHelpTopic::Meta,
+        "submit" => LocalHelpTopic::Submit,
+        "resume" => LocalHelpTopic::Resume,
+        // #130e-B: help parity — surface fixes
+        "plugins" => LocalHelpTopic::Plugins,
+        "prompt" => LocalHelpTopic::Prompt,
         _ => return None,
     };
     Some(Ok(CliAction::HelpTopic(topic)))
@@ -5910,6 +6152,65 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Formats          text (default), json
   Related          claw doctor · claw status"
             .to_string(),
+        // #130c: help topic for `claw diff --help`.
+        LocalHelpTopic::Diff => "Diff
+  Usage            claw diff [--output-format <format>]
+  Purpose          show local git staged + unstaged changes for the current workspace
+  Requires         workspace must be inside a git repository
+  Output           unified diff (text) or structured diff object (json)
+  Formats          text (default), json
+  Related          claw status · claw config"
+            .to_string(),
+        // #130d: help topic for `claw config --help`.
+        LocalHelpTopic::Config => "Config
+  Usage            claw config [--cwd <path>] [--output-format <format>]
+  Purpose          merge and display the resolved .claw.json / settings.json configuration
+  Options          --cwd overrides the workspace directory for config lookup
+  Output           loaded files and merged key-value pairs (text) or JSON object (json)
+  Formats          text (default), json
+  Related          claw status · claw doctor · claw init"
+            .to_string(),
+        // #130e: help topic for `claw help --help` (meta-help).
+        LocalHelpTopic::Meta => "Help
+  Usage            claw help [--output-format <format>]
+  Purpose          show the full CLI help text (all subcommands, flags, environment)
+  Aliases          claw --help · claw -h
+  Formats          text (default), json
+  Related          claw <subcommand> --help · claw version"
+            .to_string(),
+        // #130e: help topic for `claw submit --help`.
+        LocalHelpTopic::Submit => "Submit
+  Usage            claw submit [--session <id|latest>] <prompt-text>
+  Purpose          send a prompt to an existing managed session without starting a new one
+  Defaults         --session latest (resumes the most recent managed session)
+  Requires         valid Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)
+  Related          claw prompt · claw --resume · /session list"
+            .to_string(),
+        // #130e: help topic for `claw resume --help`.
+        LocalHelpTopic::Resume => "Resume
+  Usage            claw resume [<session-id|latest>]
+  Purpose          restart an interactive REPL attached to a managed session
+  Defaults         latest session if no argument provided
+  Requires         valid Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)
+  Related          claw submit · claw --resume · /session list"
+            .to_string(),
+        // #130e-B: help topic for `claw plugins --help`.
+        LocalHelpTopic::Plugins => "Plugins
+  Usage            claw plugins [list|install|enable|disable|uninstall|update] [<target>]
+  Purpose          manage bundled and user plugins from the CLI surface
+  Defaults         list (no action prints inventory)
+  Sources          .claw/plugins.json, bundled catalog, user-installed
+  Formats          text (default), json
+  Related          claw mcp · claw skills · /plugins (REPL)"
+            .to_string(),
+        // #130e-B: help topic for `claw prompt --help`.
+        LocalHelpTopic::Prompt => "Prompt
+  Usage            claw prompt <prompt-text>
+  Purpose          run a single-turn, non-interactive prompt and exit (like --print mode)
+  Flags            --model · --allowedTools · --output-format · --compact
+  Requires         valid Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)
+  Related          claw submit · claw (bare, interactive REPL)"
+            .to_string(),
     }
 }
 
@@ -6743,7 +7044,10 @@ fn run_export(
     let markdown = render_session_markdown(&session, &handle.id, &handle.path);
 
     if let Some(path) = output_path {
-        fs::write(path, &markdown)?;
+        // #130b: Wrap io::Error with operation context so classifier recognizes filesystem failures.
+        fs::write(path, &markdown).map_err(|e| -> Box<dyn std::error::Error> {
+            contextualize_io_error("export", &path.display().to_string(), e).into()
+        })?;
         let report = format!(
             "Export\n  Result           wrote markdown transcript\n  File             {}\n  Session          {}\n  Messages         {}",
             path.display(),
@@ -10053,6 +10357,285 @@ mod tests {
             CliAction::Diff {
                 output_format: CliOutputFormat::Json,
             }
+        );
+        // #251: session-management verbs (list-sessions, load-session,
+        // delete-session, flush-transcript) must be intercepted at top-level
+        // parse and returned as CliAction variants. Previously they fell
+        // through to `_other => Prompt` and emitted `missing_credentials`
+        // for purely-local operations.
+        assert_eq!(
+            parse_args(&["list-sessions".to_string()])
+                .expect("list-sessions should parse"),
+            CliAction::ListSessions {
+                output_format: CliOutputFormat::Text,
+            },
+            "list-sessions must dispatch to ListSessions, not fall through to Prompt"
+        );
+        assert_eq!(
+            parse_args(&[
+                "list-sessions".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ])
+            .expect("list-sessions --output-format json should parse"),
+            CliAction::ListSessions {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "load-session".to_string(),
+                "my-session-id".to_string(),
+            ])
+            .expect("load-session <id> should parse"),
+            CliAction::LoadSession {
+                session_reference: "my-session-id".to_string(),
+                output_format: CliOutputFormat::Text,
+            },
+            "load-session must dispatch to LoadSession, not fall through to Prompt"
+        );
+        assert_eq!(
+            parse_args(&[
+                "delete-session".to_string(),
+                "my-session-id".to_string(),
+            ])
+            .expect("delete-session <id> should parse"),
+            CliAction::DeleteSession {
+                session_id: "my-session-id".to_string(),
+                output_format: CliOutputFormat::Text,
+            },
+            "delete-session must dispatch to DeleteSession, not fall through to Prompt"
+        );
+        assert_eq!(
+            parse_args(&[
+                "flush-transcript".to_string(),
+                "my-session-id".to_string(),
+            ])
+            .expect("flush-transcript <id> should parse"),
+            CliAction::FlushTranscript {
+                session_id: "my-session-id".to_string(),
+                output_format: CliOutputFormat::Text,
+            },
+            "flush-transcript must dispatch to FlushTranscript, not fall through to Prompt"
+        );
+        // #251: required positional arguments for session verbs
+        let load_err = parse_args(&["load-session".to_string()])
+            .expect_err("load-session without id should be rejected");
+        assert!(
+            load_err.contains("load-session requires a session-id"),
+            "missing session-id error should be specific, got: {load_err}"
+        );
+        let delete_err = parse_args(&["delete-session".to_string()])
+            .expect_err("delete-session without id should be rejected");
+        assert!(
+            delete_err.contains("delete-session requires a session-id"),
+            "missing session-id error should be specific, got: {delete_err}"
+        );
+        // #251: extra arguments must be rejected
+        let extra_err = parse_args(&[
+            "list-sessions".to_string(),
+            "unexpected".to_string(),
+        ])
+        .expect_err("list-sessions with extra args should be rejected");
+        assert!(
+            extra_err.contains("unexpected extra arguments"),
+            "extra-args error should be specific, got: {extra_err}"
+        );
+        // #130b: classify_error_kind must recognize filesystem operation errors.
+        // Messages produced by contextualize_io_error() must route to
+        // "filesystem_io_error" kind, not default "unknown". This closes the
+        // context-loss chain (run_export -> fs::write -> ? -> to_string ->
+        // classify miss -> unknown) that #130b identified.
+        let export_err_msg = "export failed: /tmp/bad/path (No such file or directory (os error 2))";
+        assert_eq!(
+            classify_error_kind(export_err_msg),
+            "filesystem_io_error",
+            "#130b: export fs::write errors must classify as filesystem_io_error, not unknown"
+        );
+        let diff_err_msg = "diff failed: /tmp/nowhere (Permission denied (os error 13))";
+        assert_eq!(
+            classify_error_kind(diff_err_msg),
+            "filesystem_io_error",
+            "#130b: diff fs errors must classify as filesystem_io_error"
+        );
+        let config_err_msg = "config failed: /tmp/x (Is a directory (os error 21))";
+        assert_eq!(
+            classify_error_kind(config_err_msg),
+            "filesystem_io_error",
+            "#130b: config fs errors must classify as filesystem_io_error"
+        );
+        // #130b: contextualize_io_error must produce messages that the classifier recognizes.
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let enriched = super::contextualize_io_error("export", "/tmp/bad/path", io_err);
+        assert!(
+            enriched.contains("export failed:"),
+            "#130b: contextualize_io_error must include operation name, got: {enriched}"
+        );
+        assert!(
+            enriched.contains("/tmp/bad/path"),
+            "#130b: contextualize_io_error must include target path, got: {enriched}"
+        );
+        assert_eq!(
+            classify_error_kind(&enriched),
+            "filesystem_io_error",
+            "#130b: enriched messages must be classifier-recognizable"
+        );
+        // #130c: `claw diff --help` must route to help topic, not reject as extra args.
+        // Regression: `diff` was the outlier among local introspection commands
+        // (status/config/mcp all accepted --help) because its parser arm rejected
+        // all extra args before help detection could run.
+        let diff_help_action = parse_args(&[
+            "diff".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("diff --help must parse as help action");
+        assert!(
+            matches!(diff_help_action, CliAction::HelpTopic(LocalHelpTopic::Diff)),
+            "#130c: diff --help must route to LocalHelpTopic::Diff, got: {diff_help_action:?}"
+        );
+        let diff_h_action = parse_args(&[
+            "diff".to_string(),
+            "-h".to_string(),
+        ])
+        .expect("diff -h must parse as help action");
+        assert!(
+            matches!(diff_h_action, CliAction::HelpTopic(LocalHelpTopic::Diff)),
+            "#130c: diff -h (short form) must route to LocalHelpTopic::Diff"
+        );
+        // #130c: bare `claw diff` still routes to Diff action, not help.
+        let diff_action = parse_args(&[
+            "diff".to_string(),
+        ])
+        .expect("bare diff must parse as diff action");
+        assert!(
+            matches!(diff_action, CliAction::Diff { .. }),
+            "#130c: bare diff must still route to Diff action, got: {diff_action:?}"
+        );
+        // #130c: unknown args still rejected (non-regression).
+        let diff_bad_arg = parse_args(&[
+            "diff".to_string(),
+            "foo".to_string(),
+        ])
+        .expect_err("diff foo must still be rejected as extra args");
+        assert!(
+            diff_bad_arg.contains("unexpected extra arguments"),
+            "#130c: diff with unknown arg must still error, got: {diff_bad_arg}"
+        );
+        // #130d: `claw config --help` must route to help topic, not silently run config.
+        let config_help_action = parse_args(&[
+            "config".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("config --help must parse as help action");
+        assert!(
+            matches!(config_help_action, CliAction::HelpTopic(LocalHelpTopic::Config)),
+            "#130d: config --help must route to LocalHelpTopic::Config, got: {config_help_action:?}"
+        );
+        let config_h_action = parse_args(&[
+            "config".to_string(),
+            "-h".to_string(),
+        ])
+        .expect("config -h must parse as help action");
+        assert!(
+            matches!(config_h_action, CliAction::HelpTopic(LocalHelpTopic::Config)),
+            "#130d: config -h (short form) must route to LocalHelpTopic::Config"
+        );
+        // #130d: bare `claw config` still routes to Config action with no section
+        let config_action = parse_args(&[
+            "config".to_string(),
+        ])
+        .expect("bare config must parse as config action");
+        assert!(
+            matches!(config_action, CliAction::Config { section: None, .. }),
+            "#130d: bare config must still route to Config action with section=None"
+        );
+        // #130d: config with section still works (non-regression)
+        let config_section = parse_args(&[
+            "config".to_string(),
+            "permissions".to_string(),
+        ])
+        .expect("config permissions must parse");
+        assert!(
+            matches!(config_section, CliAction::Config { section: Some(ref s), .. } if s == "permissions"),
+            "#130d: config with section must still work"
+        );
+        // #130e: dispatch-order help fixes for help, submit, resume
+        // These previously emitted `missing_credentials` instead of showing help,
+        // because parse_local_help_action() didn't route them. Now they route
+        // to dedicated help topics before credential check.
+        let help_help = parse_args(&[
+            "help".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("help --help must parse as help action");
+        assert!(
+            matches!(help_help, CliAction::HelpTopic(LocalHelpTopic::Meta)),
+            "#130e: help --help must route to LocalHelpTopic::Meta, got: {help_help:?}"
+        );
+        let submit_help = parse_args(&[
+            "submit".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("submit --help must parse as help action");
+        assert!(
+            matches!(submit_help, CliAction::HelpTopic(LocalHelpTopic::Submit)),
+            "#130e: submit --help must route to LocalHelpTopic::Submit"
+        );
+        let resume_help = parse_args(&[
+            "resume".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("resume --help must parse as help action");
+        assert!(
+            matches!(resume_help, CliAction::HelpTopic(LocalHelpTopic::Resume)),
+            "#130e: resume --help must route to LocalHelpTopic::Resume"
+        );
+        // Short form `-h` works for all three
+        let help_h = parse_args(&["help".to_string(), "-h".to_string()])
+            .expect("help -h must parse");
+        assert!(matches!(help_h, CliAction::HelpTopic(LocalHelpTopic::Meta)));
+        let submit_h = parse_args(&["submit".to_string(), "-h".to_string()])
+            .expect("submit -h must parse");
+        assert!(matches!(submit_h, CliAction::HelpTopic(LocalHelpTopic::Submit)));
+        let resume_h = parse_args(&["resume".to_string(), "-h".to_string()])
+            .expect("resume -h must parse");
+        assert!(matches!(resume_h, CliAction::HelpTopic(LocalHelpTopic::Resume)));
+        // #130e-B: surface-level help fixes for plugins and prompt.
+        // These previously emitted "Unknown action" (plugins) or wrong help (prompt).
+        let plugins_help = parse_args(&[
+            "plugins".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("plugins --help must parse as help action");
+        assert!(
+            matches!(plugins_help, CliAction::HelpTopic(LocalHelpTopic::Plugins)),
+            "#130e-B: plugins --help must route to LocalHelpTopic::Plugins, got: {plugins_help:?}"
+        );
+        let prompt_help = parse_args(&[
+            "prompt".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("prompt --help must parse as help action");
+        assert!(
+            matches!(prompt_help, CliAction::HelpTopic(LocalHelpTopic::Prompt)),
+            "#130e-B: prompt --help must route to LocalHelpTopic::Prompt, got: {prompt_help:?}"
+        );
+        // Short forms
+        let plugins_h = parse_args(&["plugins".to_string(), "-h".to_string()])
+            .expect("plugins -h must parse");
+        assert!(matches!(plugins_h, CliAction::HelpTopic(LocalHelpTopic::Plugins)));
+        let prompt_h = parse_args(&["prompt".to_string(), "-h".to_string()])
+            .expect("prompt -h must parse");
+        assert!(matches!(prompt_h, CliAction::HelpTopic(LocalHelpTopic::Prompt)));
+        // Non-regression: `prompt "actual text"` still parses as Prompt action
+        let prompt_action = parse_args(&[
+            "prompt".to_string(),
+            "hello world".to_string(),
+        ])
+        .expect("prompt with real text must parse");
+        assert!(
+            matches!(prompt_action, CliAction::Prompt { ref prompt, .. } if prompt == "hello world"),
+            "#130e-B: prompt with real text must route to Prompt action"
         );
         // #147: empty / whitespace-only positional args must be rejected
         // with a specific error instead of falling through to the prompt
