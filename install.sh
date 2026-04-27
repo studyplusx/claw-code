@@ -1,394 +1,455 @@
-#!/usr/bin/env bash
-# Claw Code installer
-#
-# Detects the host OS, verifies the Rust toolchain (rustc + cargo),
-# builds the `claw` binary from the `rust/` workspace, and runs a
-# post-install verification step. Supports Linux, macOS, and WSL.
-#
-# Usage:
-#   ./install.sh                # debug build (fast, default)
-#   ./install.sh --release      # optimized release build
-#   ./install.sh --no-verify    # skip post-install verification
-#   ./install.sh --help         # print usage
-#
-# Environment overrides:
-#   CLAW_BUILD_PROFILE=debug|release   same as --release toggle
-#   CLAW_SKIP_VERIFY=1                 same as --no-verify
+#!/bin/sh
+# This script installs Ollama on Linux and macOS.
+# It detects the current operating system architecture and installs the appropriate version of Ollama.
 
-set -euo pipefail
+# Wrap script in main function so that a truncated partial download doesn't end
+# up executing half a script.
+main() {
 
-# ---------------------------------------------------------------------------
-# Pretty printing
-# ---------------------------------------------------------------------------
+set -eu
 
-if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
-    COLOR_RESET="$(tput sgr0)"
-    COLOR_BOLD="$(tput bold)"
-    COLOR_DIM="$(tput dim)"
-    COLOR_RED="$(tput setaf 1)"
-    COLOR_GREEN="$(tput setaf 2)"
-    COLOR_YELLOW="$(tput setaf 3)"
-    COLOR_BLUE="$(tput setaf 4)"
-    COLOR_CYAN="$(tput setaf 6)"
-else
-    COLOR_RESET=""
-    COLOR_BOLD=""
-    COLOR_DIM=""
-    COLOR_RED=""
-    COLOR_GREEN=""
-    COLOR_YELLOW=""
-    COLOR_BLUE=""
-    COLOR_CYAN=""
+red="$( (/usr/bin/tput bold || :; /usr/bin/tput setaf 1 || :) 2>&-)"
+plain="$( (/usr/bin/tput sgr0 || :) 2>&-)"
+
+status() { echo ">>> $*" >&2; }
+error() { echo "${red}ERROR:${plain} $*"; exit 1; }
+warning() { echo "${red}WARNING:${plain} $*"; }
+
+TEMP_DIR=$(mktemp -d)
+cleanup() { rm -rf $TEMP_DIR; }
+trap cleanup EXIT
+
+available() { command -v $1 >/dev/null; }
+require() {
+    local MISSING=''
+    for TOOL in $*; do
+        if ! available $TOOL; then
+            MISSING="$MISSING $TOOL"
+        fi
+    done
+
+    echo $MISSING
+}
+
+OS="$(uname -s)"
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    *) error "Unsupported architecture: $ARCH" ;;
+esac
+
+VER_PARAM="${OLLAMA_VERSION:+?version=$OLLAMA_VERSION}"
+
+###########################################
+# macOS
+###########################################
+
+if [ "$OS" = "Darwin" ]; then
+    NEEDS=$(require curl unzip)
+    if [ -n "$NEEDS" ]; then
+        status "ERROR: The following tools are required but missing:"
+        for NEED in $NEEDS; do
+            echo "  - $NEED"
+        done
+        exit 1
+    fi
+
+    DOWNLOAD_URL="https://ollama.com/download/Ollama-darwin.zip${VER_PARAM}"
+
+    if pgrep -x Ollama >/dev/null 2>&1; then
+        status "Stopping running Ollama instance..."
+        pkill -x Ollama 2>/dev/null || true
+        sleep 2
+    fi
+
+    if [ -d "/Applications/Ollama.app" ]; then
+        status "Removing existing Ollama installation..."
+        rm -rf "/Applications/Ollama.app"
+    fi
+
+    status "Downloading Ollama for macOS..."
+    curl --fail --show-error --location --progress-bar \
+        -o "$TEMP_DIR/Ollama-darwin.zip" "$DOWNLOAD_URL"
+
+    status "Installing Ollama to /Applications..."
+    unzip -q "$TEMP_DIR/Ollama-darwin.zip" -d "$TEMP_DIR"
+    mv "$TEMP_DIR/Ollama.app" "/Applications/"
+
+    if [ ! -L "/usr/local/bin/ollama" ] || [ "$(readlink "/usr/local/bin/ollama")" != "/Applications/Ollama.app/Contents/Resources/ollama" ]; then
+        status "Adding 'ollama' command to PATH (may require password)..."
+        mkdir -p "/usr/local/bin" 2>/dev/null || sudo mkdir -p "/usr/local/bin"
+        ln -sf "/Applications/Ollama.app/Contents/Resources/ollama" "/usr/local/bin/ollama" 2>/dev/null || \
+            sudo ln -sf "/Applications/Ollama.app/Contents/Resources/ollama" "/usr/local/bin/ollama"
+    fi
+
+    if [ -z "${OLLAMA_NO_START:-}" ]; then
+        status "Starting Ollama..."
+        open -a Ollama --args hidden
+    fi
+
+    status "Install complete. You can now run 'ollama'."
+    exit 0
 fi
 
-CURRENT_STEP=0
-TOTAL_STEPS=6
+###########################################
+# Linux
+###########################################
 
-step() {
-    CURRENT_STEP=$((CURRENT_STEP + 1))
-    printf '\n%s[%d/%d]%s %s%s%s\n' \
-        "${COLOR_BLUE}" "${CURRENT_STEP}" "${TOTAL_STEPS}" "${COLOR_RESET}" \
-        "${COLOR_BOLD}" "$1" "${COLOR_RESET}"
+[ "$OS" = "Linux" ] || error 'This script is intended to run on Linux and macOS only.'
+
+IS_WSL2=false
+
+KERN=$(uname -r)
+case "$KERN" in
+    *icrosoft*WSL2 | *icrosoft*wsl2) IS_WSL2=true;;
+    *icrosoft) error "Microsoft WSL1 is not currently supported. Please use WSL2 with 'wsl --set-version <distro> 2'" ;;
+    *) ;;
+esac
+
+SUDO=
+if [ "$(id -u)" -ne 0 ]; then
+    # Running as root, no need for sudo
+    if ! available sudo; then
+        error "This script requires superuser permissions. Please re-run as root."
+    fi
+
+    SUDO="sudo"
+fi
+
+NEEDS=$(require curl awk grep sed tee xargs)
+if [ -n "$NEEDS" ]; then
+    status "ERROR: The following tools are required but missing:"
+    for NEED in $NEEDS; do
+        echo "  - $NEED"
+    done
+    exit 1
+fi
+
+# Function to download and extract with fallback from zst to tgz
+download_and_extract() {
+    local url_base="$1"
+    local dest_dir="$2"
+    local filename="$3"
+
+    # Check if .tar.zst is available
+    if curl --fail --silent --head --location "${url_base}/${filename}.tar.zst${VER_PARAM}" >/dev/null 2>&1; then
+        # zst file exists - check if we have zstd tool
+        if ! available zstd; then
+            error "This version requires zstd for extraction. Please install zstd and try again:
+  - Debian/Ubuntu: sudo apt-get install zstd
+  - RHEL/CentOS/Fedora: sudo dnf install zstd
+  - Arch: sudo pacman -S zstd"
+        fi
+
+        status "Downloading ${filename}.tar.zst"
+        curl --fail --show-error --location --progress-bar \
+            "${url_base}/${filename}.tar.zst${VER_PARAM}" | \
+            zstd -d | $SUDO tar -xf - -C "${dest_dir}"
+        return 0
+    fi
+
+    # Fall back to .tgz for older versions
+    status "Downloading ${filename}.tgz"
+    curl --fail --show-error --location --progress-bar \
+        "${url_base}/${filename}.tgz${VER_PARAM}" | \
+        $SUDO tar -xzf - -C "${dest_dir}"
 }
 
-info()  { printf '%s  ->%s %s\n' "${COLOR_CYAN}" "${COLOR_RESET}" "$1"; }
-ok()    { printf '%s  ok%s %s\n' "${COLOR_GREEN}" "${COLOR_RESET}" "$1"; }
-warn()  { printf '%s  warn%s %s\n' "${COLOR_YELLOW}" "${COLOR_RESET}" "$1"; }
-error() { printf '%s  error%s %s\n' "${COLOR_RED}" "${COLOR_RESET}" "$1" 1>&2; }
+for BINDIR in /usr/local/bin /usr/bin /bin; do
+    echo $PATH | grep -q $BINDIR && break || continue
+done
+OLLAMA_INSTALL_DIR=$(dirname ${BINDIR})
 
-print_banner() {
-    printf '%s' "${COLOR_BOLD}"
-    cat <<'EOF'
-   ____  _                   ____          _
-  / ___|| |  __ _ __      __ / ___|___   __| | ___
- | |    | | / _` |\ \ /\ / /| |   / _ \ / _` |/ _ \
- | |___ | || (_| | \ V  V / | |__| (_) | (_| |  __/
-  \____||_| \__,_|  \_/\_/   \____\___/ \__,_|\___|
+if [ -d "$OLLAMA_INSTALL_DIR/lib/ollama" ] ; then
+    status "Cleaning up old version at $OLLAMA_INSTALL_DIR/lib/ollama"
+    $SUDO rm -rf "$OLLAMA_INSTALL_DIR/lib/ollama"
+fi
+status "Installing ollama to $OLLAMA_INSTALL_DIR"
+$SUDO install -o0 -g0 -m755 -d $BINDIR
+$SUDO install -o0 -g0 -m755 -d "$OLLAMA_INSTALL_DIR/lib/ollama"
+download_and_extract "https://ollama.com/download" "$OLLAMA_INSTALL_DIR" "ollama-linux-${ARCH}"
+
+if [ "$OLLAMA_INSTALL_DIR/bin/ollama" != "$BINDIR/ollama" ] ; then
+    status "Making ollama accessible in the PATH in $BINDIR"
+    $SUDO ln -sf "$OLLAMA_INSTALL_DIR/ollama" "$BINDIR/ollama"
+fi
+
+# Check for NVIDIA JetPack systems with additional downloads
+if [ -f /etc/nv_tegra_release ] ; then
+    if grep R36 /etc/nv_tegra_release > /dev/null ; then
+        download_and_extract "https://ollama.com/download" "$OLLAMA_INSTALL_DIR" "ollama-linux-${ARCH}-jetpack6"
+    elif grep R35 /etc/nv_tegra_release > /dev/null ; then
+        download_and_extract "https://ollama.com/download" "$OLLAMA_INSTALL_DIR" "ollama-linux-${ARCH}-jetpack5"
+    else
+        warning "Unsupported JetPack version detected.  GPU may not be supported"
+    fi
+fi
+
+install_success() {
+    status 'The Ollama API is now available at 127.0.0.1:11434.'
+    status 'Install complete. Run "ollama" from the command line.'
+}
+trap install_success EXIT
+
+# Everything from this point onwards is optional.
+
+configure_systemd() {
+    if ! id ollama >/dev/null 2>&1; then
+        status "Creating ollama user..."
+        $SUDO useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
+    fi
+    if getent group render >/dev/null 2>&1; then
+        status "Adding ollama user to render group..."
+        $SUDO usermod -a -G render ollama
+    fi
+    if getent group video >/dev/null 2>&1; then
+        status "Adding ollama user to video group..."
+        $SUDO usermod -a -G video ollama
+    fi
+
+    status "Adding current user to ollama group..."
+    $SUDO usermod -a -G ollama $(whoami)
+
+    status "Creating ollama systemd service..."
+    cat <<EOF | $SUDO tee /etc/systemd/system/ollama.service >/dev/null
+[Unit]
+Description=Ollama Service
+After=network-online.target
+
+[Service]
+ExecStart=$BINDIR/ollama serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+Environment="PATH=$PATH"
+
+[Install]
+WantedBy=default.target
 EOF
-    printf '%s\n' "${COLOR_RESET}"
-    printf '%sClaw Code installer%s\n' "${COLOR_DIM}" "${COLOR_RESET}"
-}
+    SYSTEMCTL_RUNNING="$(systemctl is-system-running || true)"
+    case $SYSTEMCTL_RUNNING in
+        running|degraded)
+            status "Enabling and starting ollama service..."
+            $SUDO systemctl daemon-reload
+            $SUDO systemctl enable ollama
 
-print_usage() {
-    cat <<'EOF'
-Usage: ./install.sh [options]
-
-Options:
-  --release       Build the optimized release profile (slower, smaller binary).
-  --debug         Build the debug profile (default, faster compile).
-  --no-verify     Skip the post-install verification step.
-  -h, --help      Show this help text and exit.
-
-Environment overrides:
-  CLAW_BUILD_PROFILE   debug | release
-  CLAW_SKIP_VERIFY     set to 1 to skip verification
-EOF
-}
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-
-BUILD_PROFILE="${CLAW_BUILD_PROFILE:-debug}"
-SKIP_VERIFY="${CLAW_SKIP_VERIFY:-0}"
-
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --release)
-            BUILD_PROFILE="release"
-            ;;
-        --debug)
-            BUILD_PROFILE="debug"
-            ;;
-        --no-verify)
-            SKIP_VERIFY="1"
-            ;;
-        -h|--help)
-            print_usage
-            exit 0
+            start_service() { $SUDO systemctl restart ollama; }
+            trap start_service EXIT
             ;;
         *)
-            error "unknown argument: $1"
-            print_usage
-            exit 2
+            warning "systemd is not running"
+            if [ "$IS_WSL2" = true ]; then
+                warning "see https://learn.microsoft.com/en-us/windows/wsl/systemd#how-to-enable-systemd to enable it"
+            fi
             ;;
     esac
-    shift
+}
+
+if available systemctl; then
+    configure_systemd
+fi
+
+# WSL2 only supports GPUs via nvidia passthrough
+# so check for nvidia-smi to determine if GPU is available
+if [ "$IS_WSL2" = true ]; then
+    if available nvidia-smi && [ -n "$(nvidia-smi | grep -o "CUDA Version: [0-9]*\.[0-9]*")" ]; then
+        status "Nvidia GPU detected."
+    fi
+    install_success
+    exit 0
+fi
+
+# Don't attempt to install drivers on Jetson systems
+if [ -f /etc/nv_tegra_release ] ; then
+    status "NVIDIA JetPack ready."
+    install_success
+    exit 0
+fi
+
+# Install GPU dependencies on Linux
+if ! available lspci && ! available lshw; then
+    warning "Unable to detect NVIDIA/AMD GPU. Install lspci or lshw to automatically detect and install GPU dependencies."
+    exit 0
+fi
+
+check_gpu() {
+    # Look for devices based on vendor ID for NVIDIA and AMD
+    case $1 in
+        lspci)
+            case $2 in
+                nvidia) available lspci && lspci -d '10de:' | grep -q 'NVIDIA' || return 1 ;;
+                amdgpu) available lspci && lspci -d '1002:' | grep -q 'AMD' || return 1 ;;
+            esac ;;
+        lshw)
+            case $2 in
+                nvidia) available lshw && $SUDO lshw -c display -numeric -disable network | grep -q 'vendor: .* \[10DE\]' || return 1 ;;
+                amdgpu) available lshw && $SUDO lshw -c display -numeric -disable network | grep -q 'vendor: .* \[1002\]' || return 1 ;;
+            esac ;;
+        nvidia-smi) available nvidia-smi || return 1 ;;
+    esac
+}
+
+if check_gpu nvidia-smi; then
+    status "NVIDIA GPU installed."
+    exit 0
+fi
+
+if ! check_gpu lspci nvidia && ! check_gpu lshw nvidia && ! check_gpu lspci amdgpu && ! check_gpu lshw amdgpu; then
+    install_success
+    warning "No NVIDIA/AMD GPU detected. Ollama will run in CPU-only mode."
+    exit 0
+fi
+
+if check_gpu lspci amdgpu || check_gpu lshw amdgpu; then
+    download_and_extract "https://ollama.com/download" "$OLLAMA_INSTALL_DIR" "ollama-linux-${ARCH}-rocm"
+
+    install_success
+    status "AMD GPU ready."
+    exit 0
+fi
+
+CUDA_REPO_ERR_MSG="NVIDIA GPU detected, but your OS and Architecture are not supported by NVIDIA.  Please install the CUDA driver manually https://docs.nvidia.com/cuda/cuda-installation-guide-linux/"
+# ref: https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html#rhel-7-centos-7
+# ref: https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html#rhel-8-rocky-8
+# ref: https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html#rhel-9-rocky-9
+# ref: https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html#fedora
+install_cuda_driver_yum() {
+    status 'Installing NVIDIA repository...'
+    
+    case $PACKAGE_MANAGER in
+        yum)
+            $SUDO $PACKAGE_MANAGER -y install yum-utils
+            if curl -I --silent --fail --location "https://developer.download.nvidia.com/compute/cuda/repos/$1$2/$(uname -m | sed -e 's/aarch64/sbsa/')/cuda-$1$2.repo" >/dev/null ; then
+                $SUDO $PACKAGE_MANAGER-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/$1$2/$(uname -m | sed -e 's/aarch64/sbsa/')/cuda-$1$2.repo
+            else
+                error $CUDA_REPO_ERR_MSG
+            fi
+            ;;
+        dnf)
+            if curl -I --silent --fail --location "https://developer.download.nvidia.com/compute/cuda/repos/$1$2/$(uname -m | sed -e 's/aarch64/sbsa/')/cuda-$1$2.repo" >/dev/null ; then
+                $SUDO $PACKAGE_MANAGER config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/$1$2/$(uname -m | sed -e 's/aarch64/sbsa/')/cuda-$1$2.repo
+            else
+                error $CUDA_REPO_ERR_MSG
+            fi
+            ;;
+    esac
+
+    case $1 in
+        rhel)
+            status 'Installing EPEL repository...'
+            # EPEL is required for third-party dependencies such as dkms and libvdpau
+            $SUDO $PACKAGE_MANAGER -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-$2.noarch.rpm || true
+            ;;
+    esac
+
+    status 'Installing CUDA driver...'
+
+    if [ "$1" = 'centos' ] || [ "$1$2" = 'rhel7' ]; then
+        $SUDO $PACKAGE_MANAGER -y install nvidia-driver-latest-dkms
+    fi
+
+    $SUDO $PACKAGE_MANAGER -y install cuda-drivers
+}
+
+# ref: https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html#ubuntu
+# ref: https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html#debian
+install_cuda_driver_apt() {
+    status 'Installing NVIDIA repository...'
+    if curl -I --silent --fail --location "https://developer.download.nvidia.com/compute/cuda/repos/$1$2/$(uname -m | sed -e 's/aarch64/sbsa/')/cuda-keyring_1.1-1_all.deb" >/dev/null ; then
+        curl -fsSL -o $TEMP_DIR/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/$1$2/$(uname -m | sed -e 's/aarch64/sbsa/')/cuda-keyring_1.1-1_all.deb
+    else
+        error $CUDA_REPO_ERR_MSG
+    fi
+
+    case $1 in
+        debian)
+            status 'Enabling contrib sources...'
+            $SUDO sed 's/main/contrib/' < /etc/apt/sources.list | $SUDO tee /etc/apt/sources.list.d/contrib.list > /dev/null
+            if [ -f "/etc/apt/sources.list.d/debian.sources" ]; then
+                $SUDO sed 's/main/contrib/' < /etc/apt/sources.list.d/debian.sources | $SUDO tee /etc/apt/sources.list.d/contrib.sources > /dev/null
+            fi
+            ;;
+    esac
+
+    status 'Installing CUDA driver...'
+    $SUDO dpkg -i $TEMP_DIR/cuda-keyring.deb
+    $SUDO apt-get update
+
+    [ -n "$SUDO" ] && SUDO_E="$SUDO -E" || SUDO_E=
+    DEBIAN_FRONTEND=noninteractive $SUDO_E apt-get -y install cuda-drivers -q
+}
+
+if [ ! -f "/etc/os-release" ]; then
+    error "Unknown distribution. Skipping CUDA installation."
+fi
+
+. /etc/os-release
+
+OS_NAME=$ID
+OS_VERSION=$VERSION_ID
+
+PACKAGE_MANAGER=
+for PACKAGE_MANAGER in dnf yum apt-get; do
+    if available $PACKAGE_MANAGER; then
+        break
+    fi
 done
 
-case "${BUILD_PROFILE}" in
-    debug|release) ;;
-    *)
-        error "invalid build profile: ${BUILD_PROFILE} (expected debug or release)"
-        exit 2
-        ;;
-esac
+if [ -z "$PACKAGE_MANAGER" ]; then
+    error "Unknown package manager. Skipping CUDA installation."
+fi
 
-# ---------------------------------------------------------------------------
-# Troubleshooting hints
-# ---------------------------------------------------------------------------
+if ! check_gpu nvidia-smi || [ -z "$(nvidia-smi | grep -o "CUDA Version: [0-9]*\.[0-9]*")" ]; then
+    case $OS_NAME in
+        centos|rhel) install_cuda_driver_yum 'rhel' $(echo $OS_VERSION | cut -d '.' -f 1) ;;
+        rocky) install_cuda_driver_yum 'rhel' $(echo $OS_VERSION | cut -c1) ;;
+        fedora) [ $OS_VERSION -lt '39' ] && install_cuda_driver_yum $OS_NAME $OS_VERSION || install_cuda_driver_yum $OS_NAME '39';;
+        amzn) install_cuda_driver_yum 'fedora' '37' ;;
+        debian) install_cuda_driver_apt $OS_NAME $OS_VERSION ;;
+        ubuntu) install_cuda_driver_apt $OS_NAME $(echo $OS_VERSION | sed 's/\.//') ;;
+        *) exit ;;
+    esac
+fi
 
-print_troubleshooting() {
-    cat <<EOF
+if ! lsmod | grep -q nvidia || ! lsmod | grep -q nvidia_uvm; then
+    KERNEL_RELEASE="$(uname -r)"
+    case $OS_NAME in
+        rocky) $SUDO $PACKAGE_MANAGER -y install kernel-devel kernel-headers ;;
+        centos|rhel|amzn) $SUDO $PACKAGE_MANAGER -y install kernel-devel-$KERNEL_RELEASE kernel-headers-$KERNEL_RELEASE ;;
+        fedora) $SUDO $PACKAGE_MANAGER -y install kernel-devel-$KERNEL_RELEASE ;;
+        debian|ubuntu) $SUDO apt-get -y install linux-headers-$KERNEL_RELEASE ;;
+        *) exit ;;
+    esac
 
-${COLOR_BOLD}Troubleshooting${COLOR_RESET}
-${COLOR_DIM}---------------${COLOR_RESET}
+    NVIDIA_CUDA_VERSION=$($SUDO dkms status | awk -F: '/added/ { print $1 }')
+    if [ -n "$NVIDIA_CUDA_VERSION" ]; then
+        $SUDO dkms install $NVIDIA_CUDA_VERSION
+    fi
 
-  ${COLOR_BOLD}1. Rust toolchain missing${COLOR_RESET}
-     Install Rust via rustup:
-       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-     Then reload your shell or run:
-       source "\$HOME/.cargo/env"
+    if lsmod | grep -q nouveau; then
+        status 'Reboot to complete NVIDIA CUDA driver install.'
+        exit 0
+    fi
 
-  ${COLOR_BOLD}2. Linux: missing system packages${COLOR_RESET}
-     The build needs git, pkg-config, and OpenSSL headers.
-     Debian/Ubuntu:
-       sudo apt-get update && sudo apt-get install -y \\
-         git pkg-config libssl-dev ca-certificates build-essential
-     Fedora/RHEL:
-       sudo dnf install -y git pkgconf-pkg-config openssl-devel gcc
-     Arch:
-       sudo pacman -S --needed git pkgconf openssl base-devel
+    $SUDO modprobe nvidia
+    $SUDO modprobe nvidia_uvm
+fi
 
-  ${COLOR_BOLD}3. macOS: missing Xcode CLT${COLOR_RESET}
-     Install the command line tools:
-       xcode-select --install
-
-  ${COLOR_BOLD}4. Windows users${COLOR_RESET}
-     Run this script from inside a WSL distro (Ubuntu/Debian recommended).
-     Native Windows builds are not supported by this installer.
-
-  ${COLOR_BOLD}5. Build fails partway through${COLOR_RESET}
-     Try a clean build:
-       cd rust && cargo clean && cargo build --workspace
-     If the failure mentions ring/openssl, double check step 2.
-
-  ${COLOR_BOLD}6. 'claw' not found after install${COLOR_RESET}
-     The binary lives at:
-       rust/target/${BUILD_PROFILE}/claw
-     Add it to your PATH or invoke it with the full path.
-
-EOF
-}
-
-trap 'rc=$?; if [ "$rc" -ne 0 ]; then error "installation failed (exit ${rc})"; print_troubleshooting; fi' EXIT
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-require_cmd() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-# ---------------------------------------------------------------------------
-# Step 1: detect OS / arch / WSL
-# ---------------------------------------------------------------------------
-
-print_banner
-step "Detecting host environment"
-
-UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
-UNAME_M="$(uname -m 2>/dev/null || echo unknown)"
-OS_FAMILY="unknown"
-IS_WSL="0"
-
-case "${UNAME_S}" in
-    Linux*)
-        OS_FAMILY="linux"
-        if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
-            IS_WSL="1"
+# make sure the NVIDIA modules are loaded on boot with nvidia-persistenced
+if available nvidia-persistenced; then
+    $SUDO touch /etc/modules-load.d/nvidia.conf
+    MODULES="nvidia nvidia-uvm"
+    for MODULE in $MODULES; do
+        if ! grep -qxF "$MODULE" /etc/modules-load.d/nvidia.conf; then
+            echo "$MODULE" | $SUDO tee -a /etc/modules-load.d/nvidia.conf > /dev/null
         fi
-        ;;
-    Darwin*)
-        OS_FAMILY="macos"
-        ;;
-    MINGW*|MSYS*|CYGWIN*)
-        OS_FAMILY="windows-shell"
-        ;;
-esac
-
-info "uname:        ${UNAME_S} ${UNAME_M}"
-info "os family:    ${OS_FAMILY}"
-if [ "${IS_WSL}" = "1" ]; then
-    info "wsl:          yes"
+    done
 fi
 
-case "${OS_FAMILY}" in
-    linux|macos)
-        ok "supported platform detected"
-        ;;
-    windows-shell)
-        error "Detected a native Windows shell (MSYS/Cygwin/MinGW)."
-        error "Please re-run this script from inside a WSL distribution."
-        exit 1
-        ;;
-    *)
-        error "Unsupported or unknown OS: ${UNAME_S}"
-        error "Supported: Linux, macOS, and Windows via WSL."
-        exit 1
-        ;;
-esac
+status "NVIDIA GPU ready."
+install_success
+}
 
-# ---------------------------------------------------------------------------
-# Step 2: locate the Rust workspace
-# ---------------------------------------------------------------------------
-
-step "Locating the Rust workspace"
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-RUST_DIR="${SCRIPT_DIR}/rust"
-
-if [ ! -d "${RUST_DIR}" ]; then
-    error "Could not find rust/ workspace next to install.sh"
-    error "Expected: ${RUST_DIR}"
-    exit 1
-fi
-
-if [ ! -f "${RUST_DIR}/Cargo.toml" ]; then
-    error "Missing ${RUST_DIR}/Cargo.toml — repository layout looks unexpected."
-    exit 1
-fi
-
-ok "workspace at ${RUST_DIR}"
-
-# ---------------------------------------------------------------------------
-# Step 3: prerequisite checks
-# ---------------------------------------------------------------------------
-
-step "Checking prerequisites"
-
-MISSING_PREREQS=0
-
-if require_cmd rustc; then
-    RUSTC_VERSION="$(rustc --version 2>/dev/null || echo 'unknown')"
-    ok "rustc found: ${RUSTC_VERSION}"
-else
-    error "rustc not found in PATH"
-    MISSING_PREREQS=1
-fi
-
-if require_cmd cargo; then
-    CARGO_VERSION="$(cargo --version 2>/dev/null || echo 'unknown')"
-    ok "cargo found: ${CARGO_VERSION}"
-else
-    error "cargo not found in PATH"
-    MISSING_PREREQS=1
-fi
-
-if require_cmd git; then
-    ok "git found:  $(git --version 2>/dev/null || echo 'unknown')"
-else
-    warn "git not found — some workflows (login, session export) may degrade"
-fi
-
-if [ "${OS_FAMILY}" = "linux" ]; then
-    if require_cmd pkg-config; then
-        ok "pkg-config found"
-    else
-        warn "pkg-config not found — may be required for OpenSSL-linked crates"
-    fi
-fi
-
-if [ "${OS_FAMILY}" = "macos" ]; then
-    if ! require_cmd cc && ! xcode-select -p >/dev/null 2>&1; then
-        warn "Xcode command line tools not detected — run: xcode-select --install"
-    fi
-fi
-
-if [ "${MISSING_PREREQS}" -ne 0 ]; then
-    error "Missing required tools. See troubleshooting below."
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Step 4: build the workspace
-# ---------------------------------------------------------------------------
-
-step "Building the claw workspace (${BUILD_PROFILE})"
-
-CARGO_FLAGS=("build" "--workspace")
-if [ "${BUILD_PROFILE}" = "release" ]; then
-    CARGO_FLAGS+=("--release")
-fi
-
-info "running: cargo ${CARGO_FLAGS[*]}"
-info "this may take a few minutes on the first build"
-
-(
-    cd "${RUST_DIR}"
-    CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}" cargo "${CARGO_FLAGS[@]}"
-)
-
-CLAW_BIN="${RUST_DIR}/target/${BUILD_PROFILE}/claw"
-
-if [ ! -x "${CLAW_BIN}" ]; then
-    error "Expected binary not found at ${CLAW_BIN}"
-    error "The build reported success but the binary is missing — check cargo output above."
-    exit 1
-fi
-
-ok "built ${CLAW_BIN}"
-
-# ---------------------------------------------------------------------------
-# Step 5: post-install verification
-# ---------------------------------------------------------------------------
-
-step "Verifying the installed binary"
-
-if [ "${SKIP_VERIFY}" = "1" ]; then
-    warn "verification skipped (--no-verify or CLAW_SKIP_VERIFY=1)"
-else
-    info "running: claw --version"
-    if VERSION_OUT="$("${CLAW_BIN}" --version 2>&1)"; then
-        ok "claw --version -> ${VERSION_OUT}"
-    else
-        error "claw --version failed:"
-        printf '%s\n' "${VERSION_OUT}" 1>&2
-        exit 1
-    fi
-
-    info "running: claw --help (smoke test)"
-    if "${CLAW_BIN}" --help >/dev/null 2>&1; then
-        ok "claw --help responded"
-    else
-        error "claw --help failed"
-        exit 1
-    fi
-fi
-
-# ---------------------------------------------------------------------------
-# Step 6: next steps
-# ---------------------------------------------------------------------------
-
-step "Next steps"
-
-cat <<EOF
-${COLOR_GREEN}Claw Code is built and ready.${COLOR_RESET}
-
-  Binary:  ${COLOR_BOLD}${CLAW_BIN}${COLOR_RESET}
-  Profile: ${BUILD_PROFILE}
-
-Try it out:
-
-  ${COLOR_DIM}# interactive REPL${COLOR_RESET}
-  ${CLAW_BIN}
-
-  ${COLOR_DIM}# one-shot prompt${COLOR_RESET}
-  ${CLAW_BIN} prompt "summarize this repository"
-
-  ${COLOR_DIM}# health check (run /doctor inside the REPL)${COLOR_RESET}
-  ${CLAW_BIN}
-  /doctor
-
-Authentication:
-
-  export ANTHROPIC_API_KEY="sk-ant-..."
-  ${COLOR_DIM}# or use OAuth:${COLOR_RESET}
-  ${CLAW_BIN} login
-
-For deeper docs, see USAGE.md and rust/README.md.
-EOF
-
-# clear the failure trap on clean exit
-trap - EXIT
+main
